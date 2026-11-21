@@ -206,6 +206,7 @@ docker run --rm --network bridge curlimages/curl -s http://192.168.0.191:8081/he
 | `build/bench_om.py` | 纯 pyACL 延迟基准（绕开 HTTP） |
 | `build/quality_check.py` | 语义区分度（pos/neg margin）对比，用于选型 |
 | `build/test_acl_infer.py` | 最小可用 pyACL 前向样例 |
+| `scripts/attach-astrbot.sh` | 把本服务注册成 AstrBot 的 OpenAI Embedding Provider（见第 10 节） |
 
 ## 9. 从零复现验证清单
 
@@ -236,3 +237,96 @@ docker run --rm --network bridge curlimages/curl -s http://192.168.0.191:8081/he
 安装全程（含 3 档 ATC）约 **6–10 分钟**，其中 ATC 单档 1–3 分钟、内存峰值 ~12 GB；
 用 SSH 直接跑会超时，建议后台执行：
 `sudo setsid bash scripts/install.sh > /tmp/inst.log 2>&1 < /dev/null &`。
+
+## 10. 接入 AstrBot（把本服务当 Embedding Provider 用）
+
+AstrBot 内置 `openai_embedding` 适配器，任何 OpenAI 兼容的 `/v1/embeddings` 都能接。
+本服务的维度是 **512**（bge-small-zh-v1.5），不是 OpenAI 的 1536/3072，所以有两个易踩的点：
+
+- **`embedding_dimensions` 必须显式填 512**：`OpenAIEmbeddingProvider.get_dim()` 只在这个字段有值时才返回真实维度，
+  否则返回 **0**，向量库维度直接错。
+- **`embedding_dimensions_mode` 建议 `never`**：该字段默认 `auto` 时，适配器只对官方 `text-embedding-3*`
+  和 siliconflow 的 `qwen*` 才发 `dimensions` 参数。我们的服务其实支持 `dimensions`（会截断并重新归一化），
+  但不发更安全——避免和向量库已有维度打架。
+
+### 10.1 一键接入
+
+```bash
+# 先 dry-run 看会改什么（不会写入、不会重启容器）
+sudo bash scripts/attach-astrbot.sh --dry-run
+# 确认无误后正式执行
+sudo bash scripts/attach-astrbot.sh
+```
+
+脚本做的事：
+
+1. 从 `docker inspect <容器> -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}'` **自动取 docker 网关**。
+   AstrBot 默认是 **bridge** 网络，容器里的 `127.0.0.1` 不是宿主机，必须用网关地址（通常是 `172.18.0.1`）。
+   用桥接网关而不是 `192.168.0.191`，是因为板子的 `wlan0` 是 **DHCP**，IP 会变；docker 网关是固定的。
+2. curl `/health` 探活。
+3. 用 python3 标准库改三个 JSON（每个文件先 `.bak.<时间戳>` 备份，再写 `.tmp` 后 `os.replace` 原子替换）：
+   - `data/cmd_config.json` → `provider` 数组追加一条 embedding provider
+   - `data/config/astrbot_plugin_memory_companion_config.json` → `retrieval.embedding_enabled=true` + `embedding_provider_id`
+   - `data/config/meme_manager_config.json` → `semantic.embedding_provider_id`（**不动 `semantic.enabled`**）
+4. `docker restart` 容器，并 grep 日志确认出现 `[OpenAI Embedding] <id> Using API Base: ...`。
+
+写进 `cmd_config.json` 的条目：
+
+```json
+{
+  "id": "ascend-npu-embedding",
+  "type": "openai_embedding",
+  "provider": "openai",
+  "provider_type": "embedding",
+  "enable": true,
+  "embedding_api_base": "http://172.18.0.1:8081/v1",
+  "embedding_api_key": "not-needed",
+  "embedding_model": "bge-small-zh-v1.5",
+  "embedding_dimensions": 512,
+  "embedding_dimensions_mode": "never",
+  "timeout": 20,
+  "proxy": ""
+}
+```
+
+> `embedding_api_base` 填 `http://172.18.0.1:8081` 也行——适配器的 `_normalize_api_base()` 会自动补 `/v1`。
+
+### 10.2 手工配置（WebUI）
+
+在 AstrBot WebUI → 服务提供商 → 新增 → 类型选 **OpenAI Embedding**，按下表填：
+
+| 字段 | 值 |
+|---|---|
+| API Base | `http://172.18.0.1:8081/v1` |
+| API Key | `not-needed`（随便填非空） |
+| 模型 | `bge-small-zh-v1.5` |
+| 维度 | `512` |
+
+### 10.3 验证
+
+```bash
+# 1) 容器日志确认 provider 被加载
+docker logs --tail 200 astrbot 2>&1 | grep -i embedding
+# 期望：[OpenAI Embedding] ascend-npu-embedding Using API Base: http://172.18.0.1:8081/v1
+
+# 2) 服务端日志确认请求真的来了（会看到来源是容器 IP 172.18.0.x）
+sudo tail -f /opt/ascend-embedding/logs/embedding.log | grep embeddings
+```
+
+实测全链路证据（memory_companion 的 `/page/search` 接口）：
+
+```json
+{"embedding_enabled": true, "embedding_provider_id": "ascend-npu-embedding",
+ "embedding_reason": "applied", "embedding_candidates": 0}
+```
+
+`embedding_reason: "applied"` 表示向量召回真的走了本服务；`candidates: 0` 只是当时库里还没记忆。
+
+### 10.4 相关事实（排查用）
+
+- 插件注册的 Web API 真实前缀是 **`/api/plug/<route>`**，不是 `/api/plugin/`。
+- memory_companion 的向量召回在 `core/retrieval.py`：`embedding_reason` 取值
+  `no_embedding_provider` / `no_embedding_provider_id` / `applied`，超时由 `retrieval_advanced.embedding_timeout_ms`（默认 5000）控制。
+- 新建知识库时 AstrBot **强制**要求 `embedding_provider_id`（`kb_mgr.py`），先按上面配好再建库。
+- 改 `cmd_config.json` 必须保留 **UTF-8 BOM**（AstrBot 自己用 `encoding='utf-8-sig'` 读写），脚本已处理。
+- 换 provider 后旧的向量不会自动重算；memory_companion 会在后台按 `embedding_backfill_*` 配置补建。
