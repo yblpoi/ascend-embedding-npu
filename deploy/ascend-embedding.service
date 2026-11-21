@@ -1,0 +1,55 @@
+[Unit]
+Description=Ascend NPU Embedding Service (OpenAI-compatible)
+Documentation=https://github.com/yblpoi/ascend-embedding-npu
+After=network-online.target
+Wants=network-online.target
+# NPU 驱动就绪后再启动，避免 set_device 失败
+After=ascend-docker-runtime.service
+
+[Service]
+Type=simple
+User=HwHiAiUser
+Group=HwHiAiUser
+WorkingDirectory=/opt/ascend-embedding
+Environment="EMB_ROOT=/opt/ascend-embedding"
+Environment="EMB_MODEL_NAME=bge-small-zh-v1.5"
+Environment="EMB_MODEL_PATH=/opt/ascend-embedding/models/om/bge-small-zh-v1.5"
+Environment="EMB_TOKENIZER_PATH=/opt/ascend-embedding/models/tokenizer/bge-small-zh-v1.5"
+Environment="EMB_DEVICE_ID=0"
+Environment="EMB_MAX_LENGTH=512"
+Environment="EMB_MAX_BATCH=64"
+Environment="EMB_POOLING=cls"
+Environment="EMB_NORMALIZE=1"
+Environment="PYTHONUNBUFFERED=1"
+Environment="EMB_LOG_LEVEL=INFO"
+# 板子的 journald 从 2026-11-19 起就没再收日志（runtime journal 卡死），
+# 所以额外写一份自轮转文件日志，排查不依赖 journalctl
+Environment="EMB_LOG_FILE=/opt/ascend-embedding/logs/embedding.log"
+# NPU 相关库路径（不 source set_env.sh，避免它改 PATH 影响其它服务）
+# 与登录 shell 的 LD_LIBRARY_PATH 一致（含 opskernel/nnengine/op_tiling，缺一 import acl 就报
+# libplatform.so: undefined symbol _ZNK14ascend_private8protobuf7Message11GetTypeNameEv）
+# 注意：只用 nnal/asdsip，不含 nnal/atb（用户环境 atb 不可用）
+Environment="LD_LIBRARY_PATH=/usr/local/Ascend/nnal/asdsip/latest/lib:/usr/local/Ascend/cann-9.2.1/lib64:/usr/local/Ascend/cann-9.2.1/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.2.1/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.2.1/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver"
+Environment="PYTHONPATH=/opt/ascend-embedding/src:/usr/local/Ascend/cann-9.2.1/python/site-packages:/usr/local/Ascend/cann-9.2.1/opp/built-in/op_impl/ai_core/tbe"
+ExecStart=/opt/ascend-embedding/venv/bin/python -m uvicorn npu_embedding.app:app \
+    --host 0.0.0.0 --port 8081 --workers 1 \
+    --app-dir /opt/ascend-embedding/src \
+    --timeout-keep-alive 30 --no-access-log
+Restart=always
+RestartSec=5
+# NPU 内存是单设备共享的，绝不允许出现第二个实例
+KillMode=mixed
+TimeoutStopSec=20
+
+# ---- 资源限制：防止占满板子内存把系统卡死 ----
+MemoryMax=3G
+MemoryHigh=2.4G
+TasksMax=256
+
+# ---- 日志走 journald，落盘有上限 ----
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ascend-embedding
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+# 服务运行时
+numpy<3
+onnx
+onnxruntime
+fastapi
+uvicorn
+tokenizers
+huggingface-hub
+
+# ATC/AOE 的 python 侧依赖。ATC 会通过 PATH 上的 python3 导入这些模块
+# （AOE -> InitCannKB）。缺任何一个都会 ATC run failed:
+#   Environment_Error_Import_Python_Module_Failed(EC0010): No module named 'xxx'
+#   进而 TeConfigInfo 初始化失败、Gelu/TBE 初始化失败。
+decorator
+attrs
+psutil
+scipy
