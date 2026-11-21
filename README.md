@@ -206,3 +206,33 @@ docker run --rm --network bridge curlimages/curl -s http://192.168.0.191:8081/he
 | `build/bench_om.py` | 纯 pyACL 延迟基准（绕开 HTTP） |
 | `build/quality_check.py` | 语义区分度（pos/neg margin）对比，用于选型 |
 | `build/test_acl_infer.py` | 最小可用 pyACL 前向样例 |
+
+## 9. 从零复现验证清单
+
+下面是一台**已执行 `uninstall.sh --purge` 清空后**、仅用仓库内容 + `install.sh` 重建出来的实测记录
+（2026-11-21，板子重启过一次，验证开机自启）：
+
+| 检查项 | 命令 | 结果 |
+|---|---|---|
+| 目录清空 | `test -d /opt/ascend-embedding` | 空目录、无 uvicorn 进程 |
+| 一键安装 | `sudo bash scripts/install.sh` | 下载 → 三档 ATC 全部 `ATC run success` → 服务拉起 |
+| 开机自启 | `systemctl reboot` 后检查 | `is-active=active`、`is-enabled=enabled`、仅 1 个进程 |
+| 健康检查 | `curl :8081/health` | `{"status":"ok","model":"bge-small-zh-v1.5","max_length":512,"buckets":[128,256,512]}` |
+| 单条 | `POST /v1/embeddings` | dim 512、L2 norm 1.0、usage.prompt_tokens 正常 |
+| 批量 + 截断 | `input:[3 条], dimensions:128` | n=3、每条 dim 128、仍归一化 |
+| base64 | `encoding_format:"base64"` | 解出 2048 bytes（=512 float32） |
+| 端到端延迟 | 10 次短句 | min 8.0 ms / p50 8.2 ms / max 12.7 ms |
+| 容器 host 网络 | `docker run --rm --network host ... 127.0.0.1:8081` | 200 + 正常 JSON |
+| 容器 bridge 网络 | `docker run --rm ... 192.168.0.191:8081` | 200 + 模型列表 |
+| 容器内推理 | 容器内 POST /v1/embeddings | 返回正常向量 |
+| 内存无泄漏 | 200 次请求前后对比 | RSS 239.9 MB → 241.4 MB（+1.4 MB），MemoryCurrent 768 MB，进程数恒为 1 |
+| 卫生 | `ls /tmp`、`ls ~` | /tmp 无本项目残留；家目录项数未变（37，全为用户原有） |
+| 磁盘 | `df -h /` | 46G/229G，占用 21% |
+
+> 注意：仓库是 **private**，clone 需要 PAT：
+> `sudo git clone https://<user>:<token>@github.com/yblpoi/ascend-embedding-npu.git /opt/ascend-embedding`
+> 或走代理 `https://gh-proxy.com/https://<user>:<token>@github.com/...`。
+
+安装全程（含 3 档 ATC）约 **6–10 分钟**，其中 ATC 单档 1–3 分钟、内存峰值 ~12 GB；
+用 SSH 直接跑会超时，建议后台执行：
+`sudo setsid bash scripts/install.sh > /tmp/inst.log 2>&1 < /dev/null &`。
